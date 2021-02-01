@@ -34,10 +34,13 @@ import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
@@ -47,11 +50,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import static org.apache.kafka.common.utils.Utils.mkEntry;
+import static org.apache.kafka.common.utils.Utils.mkMap;
 import static org.apache.kafka.common.utils.Utils.mkSet;
 import static org.apache.kafka.streams.processor.internals.StateDirectory.LOCK_FILE_NAME;
 import static org.apache.kafka.streams.processor.internals.StateManagerUtil.CHECKPOINT_FILE_NAME;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.endsWith;
+import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.hasItem;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.not;
@@ -62,6 +68,8 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
 
 public class StateDirectoryTest {
 
@@ -104,6 +112,34 @@ public class StateDirectoryTest {
         assertTrue(stateDir.isDirectory());
         assertTrue(appDir.exists());
         assertTrue(appDir.isDirectory());
+    }
+
+    @Test
+    public void shouldHaveSecurePermissions() {
+        assertPermissions(stateDir);
+        assertPermissions(appDir);
+    }
+    
+    private void assertPermissions(final File file) {
+        final Path path = file.toPath();
+        if (path.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            final Set<PosixFilePermission> expectedPermissions = EnumSet.of(
+                    PosixFilePermission.OWNER_EXECUTE,
+                    PosixFilePermission.GROUP_READ,
+                    PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.GROUP_EXECUTE,
+                    PosixFilePermission.OWNER_READ);
+            try {
+                final Set<PosixFilePermission> filePermissions = Files.getPosixFilePermissions(path);
+                assertThat(expectedPermissions, equalTo(filePermissions));
+            } catch (final IOException e) {
+                fail("Should create correct files and set correct permissions");
+            }
+        } else {
+            assertThat(file.canRead(), is(true));
+            assertThat(file.canWrite(), is(true));
+            assertThat(file.canExecute(), is(true));
+        }
     }
 
     @Test
@@ -518,9 +554,13 @@ public class StateDirectoryTest {
 
     @Test
     public void shouldNotCreateBaseDirectory() throws IOException {
-        initializeStateDirectory(false);
-        assertFalse(stateDir.exists());
-        assertFalse(appDir.exists());
+        try (final LogCaptureAppender appender = LogCaptureAppender.createAndRegister(StateDirectory.class)) {
+            initializeStateDirectory(false);
+            assertThat(stateDir.exists(), is(false));
+            assertThat(appDir.exists(), is(false));
+            assertThat(appender.getMessages(),
+                not(hasItem(containsString("Error changing permissions for the state or base directory"))));
+        }
     }
 
     @Test
@@ -603,6 +643,28 @@ public class StateDirectoryTest {
             time.sleep(5000);
             directory.cleanRemovedTasks(cleanupDelayMs);
             assertThat(appender.getMessages(), hasItem(endsWith("ms has elapsed (cleanup delay is " +  cleanupDelayMs + "ms).")));
+        }
+    }
+
+    @Test
+    public void shouldLogTempDirMessage() {
+        try (final LogCaptureAppender appender = LogCaptureAppender.createAndRegister(StateDirectory.class)) {
+            new StateDirectory(
+                new StreamsConfig(
+                    mkMap(
+                        mkEntry(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, ""),
+                        mkEntry(StreamsConfig.APPLICATION_ID_CONFIG, "")
+                    )
+                ),
+                new MockTime(),
+                true
+            );
+            assertThat(
+                appender.getMessages(),
+                hasItem("Using an OS temp directory in the state.dir property can cause failures with writing the" +
+                    " checkpoint file due to the fact that this directory can be cleared by the OS." +
+                    " Resolved state.dir: [/tmp/kafka-streams]")
+            );
         }
     }
 

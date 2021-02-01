@@ -30,6 +30,7 @@ import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.AbstractRequest;
 import org.apache.kafka.common.requests.FindCoordinatorResponse;
 import org.apache.kafka.common.requests.JoinGroupResponse;
+import org.apache.kafka.common.requests.RequestTestUtils;
 import org.apache.kafka.common.requests.SyncGroupRequest;
 import org.apache.kafka.common.requests.SyncGroupResponse;
 import org.apache.kafka.common.utils.LogContext;
@@ -38,7 +39,6 @@ import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.connect.runtime.TargetState;
 import org.apache.kafka.connect.storage.KafkaConfigBackingStore;
 import org.apache.kafka.connect.util.ConnectorTaskId;
-import org.apache.kafka.test.TestUtils;
 import org.easymock.EasyMock;
 import org.easymock.Mock;
 import org.junit.After;
@@ -59,6 +59,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.kafka.connect.runtime.distributed.ConnectProtocolCompatibility.COMPATIBLE;
+import static org.apache.kafka.connect.runtime.distributed.ConnectProtocolCompatibility.EAGER;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -105,8 +107,8 @@ public class WorkerCoordinatorTest {
     @Parameters
     public static Iterable<?> mode() {
         return Arrays.asList(new Object[][]{
-                {ConnectProtocolCompatibility.EAGER, 1},
-                {ConnectProtocolCompatibility.COMPATIBLE, 2}});
+                {EAGER, 1},
+                {COMPATIBLE, 2}});
     }
 
     @Parameter
@@ -122,7 +124,7 @@ public class WorkerCoordinatorTest {
         this.time = new MockTime();
         this.metadata = new Metadata(0, Long.MAX_VALUE, logContext, new ClusterResourceListeners());
         this.client = new MockClient(time, metadata);
-        this.client.updateMetadata(TestUtils.metadataUpdateWith(1, Collections.singletonMap("topic", 1)));
+        this.client.updateMetadata(RequestTestUtils.metadataUpdateWith(1, Collections.singletonMap("topic", 1)));
         this.node = metadata.fetch().nodes().get(0);
         this.consumerClient = new ConsumerNetworkClient(logContext, client, metadata, time, 100, 1000, heartbeatIntervalMs);
         this.metrics = new Metrics(time);
@@ -255,8 +257,8 @@ public class WorkerCoordinatorTest {
             @Override
             public boolean matches(AbstractRequest body) {
                 SyncGroupRequest sync = (SyncGroupRequest) body;
-                return sync.data.memberId().equals(consumerId) &&
-                        sync.data.generationId() == 1 &&
+                return sync.data().memberId().equals(consumerId) &&
+                        sync.data().generationId() == 1 &&
                         sync.groupAssignments().containsKey(consumerId);
             }
         }, syncGroupResponse(ConnectProtocol.Assignment.NO_ERROR, "leader", 1L, Collections.singletonList(connectorId1),
@@ -292,9 +294,9 @@ public class WorkerCoordinatorTest {
             @Override
             public boolean matches(AbstractRequest body) {
                 SyncGroupRequest sync = (SyncGroupRequest) body;
-                return sync.data.memberId().equals(memberId) &&
-                        sync.data.generationId() == 1 &&
-                        sync.data.assignments().isEmpty();
+                return sync.data().memberId().equals(memberId) &&
+                        sync.data().generationId() == 1 &&
+                        sync.data().assignments().isEmpty();
             }
         }, syncGroupResponse(ConnectProtocol.Assignment.NO_ERROR, "leader", 1L, Collections.<String>emptyList(),
                 Collections.singletonList(taskId1x0), Errors.NONE));
@@ -333,9 +335,9 @@ public class WorkerCoordinatorTest {
             @Override
             public boolean matches(AbstractRequest body) {
                 SyncGroupRequest sync = (SyncGroupRequest) body;
-                return sync.data.memberId().equals(memberId) &&
-                        sync.data.generationId() == 1 &&
-                        sync.data.assignments().isEmpty();
+                return sync.data().memberId().equals(memberId) &&
+                        sync.data().generationId() == 1 &&
+                        sync.data().assignments().isEmpty();
             }
         };
         client.prepareResponse(matcher, syncGroupResponse(ConnectProtocol.Assignment.CONFIG_MISMATCH, "leader", 10L,
@@ -412,7 +414,7 @@ public class WorkerCoordinatorTest {
                 .setMemberId("member")
                 .setMetadata(ConnectProtocol.serializeMetadata(new ConnectProtocol.WorkerState(MEMBER_URL, 1L)).array())
         );
-        Map<String, ByteBuffer> result = coordinator.performAssignment("leader", WorkerCoordinator.DEFAULT_SUBPROTOCOL, responseMembers);
+        Map<String, ByteBuffer> result = coordinator.performAssignment("leader", EAGER.protocol(), responseMembers);
 
         // configState1 has 1 connector, 1 task
         ConnectProtocol.Assignment leaderAssignment = ConnectProtocol.deserializeAssignment(result.get("leader"));
@@ -455,7 +457,7 @@ public class WorkerCoordinatorTest {
                 .setMetadata(ConnectProtocol.serializeMetadata(new ConnectProtocol.WorkerState(MEMBER_URL, 1L)).array())
         );
 
-        Map<String, ByteBuffer> result = coordinator.performAssignment("leader", WorkerCoordinator.DEFAULT_SUBPROTOCOL, responseMembers);
+        Map<String, ByteBuffer> result = coordinator.performAssignment("leader", EAGER.protocol(), responseMembers);
 
         // configState2 has 2 connector, 3 tasks and should trigger round robin assignment
         ConnectProtocol.Assignment leaderAssignment = ConnectProtocol.deserializeAssignment(result.get("leader"));
@@ -498,7 +500,7 @@ public class WorkerCoordinatorTest {
                 .setMetadata(ConnectProtocol.serializeMetadata(new ConnectProtocol.WorkerState(MEMBER_URL, 1L)).array())
         );
 
-        Map<String, ByteBuffer> result = coordinator.performAssignment("leader", WorkerCoordinator.DEFAULT_SUBPROTOCOL, responseMembers);
+        Map<String, ByteBuffer> result = coordinator.performAssignment("leader", EAGER.protocol(), responseMembers);
 
         // Round robin assignment when there are the same number of connectors and tasks should result in each being
         // evenly distributed across the workers, i.e. round robin assignment of connectors first, then followed by tasks
@@ -535,7 +537,7 @@ public class WorkerCoordinatorTest {
         return new JoinGroupResponse(
                 new JoinGroupResponseData().setErrorCode(error.code())
                 .setGenerationId(generationId)
-                .setProtocolName(WorkerCoordinator.DEFAULT_SUBPROTOCOL)
+                .setProtocolName(EAGER.protocol())
                 .setLeader(memberId)
                 .setMemberId(memberId)
                 .setMembers(metadata)
@@ -546,7 +548,7 @@ public class WorkerCoordinatorTest {
         return new JoinGroupResponse(
                 new JoinGroupResponseData().setErrorCode(error.code())
                         .setGenerationId(generationId)
-                        .setProtocolName(WorkerCoordinator.DEFAULT_SUBPROTOCOL)
+                        .setProtocolName(EAGER.protocol())
                         .setLeader(leaderId)
                         .setMemberId(memberId)
                         .setMembers(Collections.emptyList())

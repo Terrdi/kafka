@@ -21,7 +21,9 @@ import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Random;
@@ -29,47 +31,49 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * This class is responsible for managing the current state of this node and ensuring only
- * valid state transitions.
+ * This class is responsible for managing the current state of this node and ensuring
+ * only valid state transitions. Below we define the possible state transitions and
+ * how they are triggered:
  *
- * Unattached =>
+ * Unattached|Resigned transitions to:
  *    Unattached: After learning of a new election with a higher epoch
  *    Voted: After granting a vote to a candidate
  *    Candidate: After expiration of the election timeout
  *    Follower: After discovering a leader with an equal or larger epoch
  *
- * Voted =>
+ * Voted transitions to:
  *    Unattached: After learning of a new election with a higher epoch
  *    Candidate: After expiration of the election timeout
  *
- * Candidate =>
+ * Candidate transitions to:
  *    Unattached: After learning of a new election with a higher epoch
  *    Candidate: After expiration of the election timeout
  *    Leader: After receiving a majority of votes
  *
- * Leader =>
+ * Leader transitions to:
  *    Unattached: After learning of a new election with a higher epoch
+ *    Resigned: When shutting down gracefully
  *
- * Follower =>
+ * Follower transitions to:
  *    Unattached: After learning of a new election with a higher epoch
  *    Candidate: After expiration of the fetch timeout
  *    Follower: After discovering a leader with a larger epoch
  *
- * Observers follow a simpler state machine. The Voted/Candidate/Leader states
- * are not possible for observers, so the only transitions that are possible are
- * between Unattached and Follower.
+ * Observers follow a simpler state machine. The Voted/Candidate/Leader/Resigned
+ * states are not possible for observers, so the only transitions that are possible
+ * are between Unattached and Follower.
  *
- * Unattached =>
+ * Unattached transitions to:
  *    Unattached: After learning of a new election with a higher epoch
  *    Follower: After discovering a leader with an equal or larger epoch
  *
- * Follower =>
+ * Follower transitions to:
  *    Unattached: After learning of a new election with a higher epoch
  *    Follower: After discovering a leader with a larger epoch
  *
  */
 public class QuorumState {
-    public final int localId;
+    private final OptionalInt localId;
     private final Time time;
     private final Logger log;
     private final QuorumStateStore store;
@@ -80,7 +84,7 @@ public class QuorumState {
 
     private volatile EpochState state;
 
-    public QuorumState(int localId,
+    public QuorumState(OptionalInt localId,
                        Set<Integer> voters,
                        int electionTimeoutMs,
                        int fetchTimeoutMs,
@@ -121,9 +125,16 @@ public class QuorumState {
         final EpochState initialState;
         if (!election.voters().isEmpty() && !voters.equals(election.voters())) {
             throw new IllegalStateException("Configured voter set: " + voters
-                + " is different from the voter set read from the state file: " + election.voters() +
-                ". Check if the quorum configuration is up to date, " +
-                "or wipe out the local state file if necessary");
+                + " is different from the voter set read from the state file: " + election.voters()
+                + ". Check if the quorum configuration is up to date, "
+                + "or wipe out the local state file if necessary");
+        } else if (election.hasVoted() && !isVoter()) {
+            String localIdDescription = localId.isPresent() ?
+                localId.getAsInt() + " is not a voter" :
+                "is undefined";
+            throw new IllegalStateException("Initialized quorum state " + election
+                + " with a voted candidate, which indicates this node was previously "
+                + " a voter, but the local id " + localIdDescription);
         } else if (election.epoch < logEndOffsetAndEpoch.epoch) {
             log.warn("Epoch from quorum-state file is {}, which is " +
                 "smaller than last written epoch {} in the log",
@@ -132,25 +143,31 @@ public class QuorumState {
                 time,
                 logEndOffsetAndEpoch.epoch,
                 voters,
+                Optional.empty(),
                 randomElectionTimeoutMs()
             );
-        } else if (election.isLeader(localId)) {
-            // If we were previously a leader, then we will start out as unattached
-            // in the same epoch. This protects the invariant that each record
-            // is uniquely identified by offset and epoch, which might otherwise
-            // be violated if unflushed data is lost after restarting.
-            initialState = new UnattachedState(
+        } else if (localId.isPresent() && election.isLeader(localId.getAsInt())) {
+            // If we were previously a leader, then we will start out as resigned
+            // in the same epoch. This serves two purposes:
+            // 1. It ensures that we cannot vote for another leader in the same epoch.
+            // 2. It protects the invariant that each record is uniquely identified by
+            //    offset and epoch, which might otherwise be violated if unflushed data
+            //    is lost after restarting.
+            initialState = new ResignedState(
                 time,
+                localId.getAsInt(),
                 election.epoch,
                 voters,
-                randomElectionTimeoutMs()
+                randomElectionTimeoutMs(),
+                Collections.emptyList()
             );
-        } else if (election.isCandidate(localId)) {
+        } else if (localId.isPresent() && election.isVotedCandidate(localId.getAsInt())) {
             initialState = new CandidateState(
                 time,
-                localId,
+                localId.getAsInt(),
                 election.epoch,
                 voters,
+                Optional.empty(),
                 1,
                 randomElectionTimeoutMs()
             );
@@ -160,6 +177,7 @@ public class QuorumState {
                 election.epoch,
                 election.votedId(),
                 voters,
+                Optional.empty(),
                 randomElectionTimeoutMs()
             );
         } else if (election.hasLeader()) {
@@ -168,6 +186,7 @@ public class QuorumState {
                 election.epoch,
                 election.leaderId(),
                 voters,
+                Optional.empty(),
                 fetchTimeoutMs
             );
         } else {
@@ -175,6 +194,7 @@ public class QuorumState {
                 time,
                 election.epoch,
                 voters,
+                Optional.empty(),
                 randomElectionTimeoutMs()
             );
         }
@@ -183,14 +203,22 @@ public class QuorumState {
     }
 
     public Set<Integer> remoteVoters() {
-        return voters.stream().filter(voterId -> voterId != localId).collect(Collectors.toSet());
+        return voters.stream().filter(voterId -> voterId != localIdOrSentinel()).collect(Collectors.toSet());
+    }
+
+    public int localIdOrSentinel() {
+        return localId.orElse(-1);
+    }
+
+    public int localIdOrThrow() {
+        return localId.orElseThrow(() -> new IllegalStateException("Required local id is not present"));
     }
 
     public int epoch() {
         return state.epoch();
     }
 
-    public int leaderIdOrNil() {
+    public int leaderIdOrSentinel() {
         return leaderId().orElse(-1);
     }
 
@@ -199,6 +227,7 @@ public class QuorumState {
     }
 
     public OptionalInt leaderId() {
+
         ElectionState election = state.election();
         if (election.hasLeader())
             return OptionalInt.of(state.election().leaderId());
@@ -211,11 +240,11 @@ public class QuorumState {
     }
 
     public boolean hasRemoteLeader() {
-        return hasLeader() && leaderIdOrNil() != localId;
+        return hasLeader() && leaderIdOrSentinel() != localIdOrSentinel();
     }
 
     public boolean isVoter() {
-        return voters.contains(localId);
+        return localId.isPresent() && voters.contains(localId.getAsInt());
     }
 
     public boolean isVoter(int nodeId) {
@@ -226,9 +255,28 @@ public class QuorumState {
         return !isVoter();
     }
 
+    public void transitionToResigned(List<Integer> preferredSuccessors) {
+        if (!isLeader()) {
+            throw new IllegalStateException("Invalid transition to Resigned state from " + state);
+        }
+
+        // The Resigned state is a soft state which does not need to be persisted.
+        // A leader will always be re-initialized in this state.
+        int epoch = state.epoch();
+        this.state = new ResignedState(
+            time,
+            localIdOrThrow(),
+            epoch,
+            voters,
+            randomElectionTimeoutMs(),
+            preferredSuccessors
+        );
+        log.info("Completed transition to {}", state);
+    }
+
     /**
-     * Transition to the "unattached" state. This means we have found an epoch strictly larger
-     * than what is currently known, but wo do not yet know of an elected leader.
+     * Transition to the "unattached" state. This means we have found an epoch greater than
+     * or equal to the current epoch, but wo do not yet know of the elected leader.
      */
     public void transitionToUnattached(int epoch) throws IOException {
         int currentEpoch = state.epoch();
@@ -254,6 +302,7 @@ public class QuorumState {
             time,
             epoch,
             voters,
+            state.highWatermark(),
             electionTimeoutMs
         ));
     }
@@ -268,7 +317,7 @@ public class QuorumState {
         int epoch,
         int candidateId
     ) throws IOException {
-        if (candidateId == localId) {
+        if (localId.isPresent() && candidateId == localId.getAsInt()) {
             throw new IllegalStateException("Cannot transition to Voted with votedId=" + candidateId +
                 " and epoch=" + epoch + " since it matches the local broker.id");
         } else if (isObserver()) {
@@ -296,6 +345,7 @@ public class QuorumState {
             epoch,
             candidateId,
             voters,
+            state.highWatermark(),
             randomElectionTimeoutMs()
         ));
     }
@@ -307,7 +357,7 @@ public class QuorumState {
         int epoch,
         int leaderId
     ) throws IOException {
-        if (leaderId == localId) {
+        if (localId.isPresent() && leaderId == localId.getAsInt()) {
             throw new IllegalStateException("Cannot transition to Follower with leaderId=" + leaderId +
                 " and epoch=" + epoch + " since it matches the local broker.id=" + localId);
         } else if (!isVoter(leaderId)) {
@@ -330,6 +380,7 @@ public class QuorumState {
             epoch,
             leaderId,
             voters,
+            state.highWatermark(),
             fetchTimeoutMs
         ));
     }
@@ -349,9 +400,10 @@ public class QuorumState {
 
         transitionTo(new CandidateState(
             time,
-            localId,
+            localIdOrThrow(),
             newEpoch,
             voters,
+            state.highWatermark(),
             retries,
             electionTimeoutMs
         ));
@@ -369,15 +421,31 @@ public class QuorumState {
         if (!candidateState.isVoteGranted())
             throw new IllegalStateException("Cannot become leader without majority votes granted");
 
+        // Note that the leader does not retain the high watermark that was known
+        // in the previous state. The reason for this is to protect the monotonicity
+        // of the global high watermark, which is exposed through the leader. The
+        // only way a new leader can be sure that the high watermark is increasing
+        // monotonically is to wait until a majority of the voters have reached the
+        // starting offset of the new epoch. The downside of this is that the local
+        // state machine is temporarily stalled by the advancement of the global
+        // high watermark even though it only depends on local monotonicity. We
+        // could address this problem by decoupling the local high watermark, but
+        // we typically expect the state machine to be caught up anyway.
+
         transitionTo(new LeaderState(
-            localId,
+            localIdOrThrow(),
             epoch(),
             epochStartOffset,
-            voters
+            voters,
+            candidateState.grantingVoters()
         ));
     }
 
     private void transitionTo(EpochState state) throws IOException {
+        if (this.state != null) {
+            this.state.close();
+        }
+
         this.store.writeElectionState(state.election());
         this.state = state;
         log.info("Completed transition to {}", state);
@@ -413,6 +481,12 @@ public class QuorumState {
         throw new IllegalStateException("Expected to be Leader, but current state is " + state);
     }
 
+    public ResignedState resignedStateOrThrow() {
+        if (isResigned())
+            return (ResignedState) state;
+        throw new IllegalStateException("Expected to be Resigned, but current state is " + state);
+    }
+
     public CandidateState candidateStateOrThrow() {
         if (isCandidate())
             return (CandidateState) state;
@@ -438,6 +512,10 @@ public class QuorumState {
 
     public boolean isLeader() {
         return state instanceof LeaderState;
+    }
+
+    public boolean isResigned() {
+        return state instanceof ResignedState;
     }
 
     public boolean isCandidate() {

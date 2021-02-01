@@ -32,6 +32,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Random;
 import java.util.Set;
@@ -59,7 +60,7 @@ public class KafkaRaftMetricsTest {
 
     private QuorumState buildQuorumState(Set<Integer> voters) {
         return new QuorumState(
-            localId,
+            OptionalInt.of(localId),
             voters,
             electionTimeoutMs,
             fetchTimeoutMs,
@@ -107,7 +108,7 @@ public class KafkaRaftMetricsTest {
         assertEquals((double) 1, getMetric(metrics, "current-leader").metricValue());
         assertEquals((double) -1, getMetric(metrics, "current-vote").metricValue());
         assertEquals((double) 2, getMetric(metrics, "current-epoch").metricValue());
-        assertEquals((double) -1L, getMetric(metrics, "high-watermark").metricValue());
+        assertEquals((double) 5L, getMetric(metrics, "high-watermark").metricValue());
 
         state.followerStateOrThrow().updateHighWatermark(OptionalLong.of(10L));
         assertEquals((double) 10L, getMetric(metrics, "high-watermark").metricValue());
@@ -117,14 +118,14 @@ public class KafkaRaftMetricsTest {
         assertEquals((double) -1, getMetric(metrics, "current-leader").metricValue());
         assertEquals((double) 2, getMetric(metrics, "current-vote").metricValue());
         assertEquals((double) 3, getMetric(metrics, "current-epoch").metricValue());
-        assertEquals((double) -1L, getMetric(metrics, "high-watermark").metricValue());
+        assertEquals((double) 10L, getMetric(metrics, "high-watermark").metricValue());
 
         state.transitionToUnattached(4);
         assertEquals("unattached", getMetric(metrics, "current-state").metricValue());
         assertEquals((double) -1, getMetric(metrics, "current-leader").metricValue());
         assertEquals((double) -1, getMetric(metrics, "current-vote").metricValue());
         assertEquals((double) 4, getMetric(metrics, "current-epoch").metricValue());
-        assertEquals((double) -1L, getMetric(metrics, "high-watermark").metricValue());
+        assertEquals((double) 10L, getMetric(metrics, "high-watermark").metricValue());
     }
 
     @Test
@@ -154,7 +155,7 @@ public class KafkaRaftMetricsTest {
         assertEquals((double) -1, getMetric(metrics, "current-leader").metricValue());
         assertEquals((double) -1, getMetric(metrics, "current-vote").metricValue());
         assertEquals((double) 4, getMetric(metrics, "current-epoch").metricValue());
-        assertEquals((double) -1L, getMetric(metrics, "high-watermark").metricValue());
+        assertEquals((double) 10L, getMetric(metrics, "high-watermark").metricValue());
     }
 
     @Test

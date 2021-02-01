@@ -22,8 +22,8 @@ import java.io.File
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.utils.Utils
 import org.easymock.EasyMock
-import org.junit._
-import org.junit.Assert._
+import org.junit.jupiter.api._
+import org.junit.jupiter.api.Assertions._
 import kafka.utils.{KafkaScheduler, MockTime, TestUtils}
 import kafka.zk.KafkaZkClient
 import java.util.concurrent.atomic.AtomicBoolean
@@ -49,7 +49,7 @@ class HighwatermarkPersistenceTest {
 
   val alterIsrManager = TestUtils.createAlterIsrManager()
 
-  @After
+  @AfterEach
   def teardown(): Unit = {
     for (manager <- logManagers; dir <- manager.liveLogDirs)
       Utils.delete(dir)
@@ -65,9 +65,10 @@ class HighwatermarkPersistenceTest {
     scheduler.startup()
     val metrics = new Metrics
     val time = new MockTime
+    val quotaManager = QuotaFactory.instantiate(configs.head, metrics, time, "")
     // create replica manager
     val replicaManager = new ReplicaManager(configs.head, metrics, time, zkClient, scheduler,
-      logManagers.head, new AtomicBoolean(false), QuotaFactory.instantiate(configs.head, metrics, time, ""),
+      logManagers.head, new AtomicBoolean(false), quotaManager,
       new BrokerTopicStats, new MetadataCache(configs.head.brokerId), logDirFailureChannels.head, alterIsrManager)
     replicaManager.startup()
     try {
@@ -99,6 +100,7 @@ class HighwatermarkPersistenceTest {
     } finally {
       // shutdown the replica manager upon test completion
       replicaManager.shutdown(false)
+      quotaManager.shutdown()
       metrics.close()
       scheduler.shutdown()
     }
@@ -115,9 +117,10 @@ class HighwatermarkPersistenceTest {
     scheduler.startup()
     val metrics = new Metrics
     val time = new MockTime
+    val quotaManager = QuotaFactory.instantiate(configs.head, metrics, time, "")
     // create replica manager
     val replicaManager = new ReplicaManager(configs.head, metrics, time, zkClient,
-      scheduler, logManagers.head, new AtomicBoolean(false), QuotaFactory.instantiate(configs.head, metrics, time, ""),
+      scheduler, logManagers.head, new AtomicBoolean(false), quotaManager,
       new BrokerTopicStats, new MetadataCache(configs.head.brokerId), logDirFailureChannels.head, alterIsrManager)
     replicaManager.startup()
     try {
@@ -169,6 +172,7 @@ class HighwatermarkPersistenceTest {
     } finally {
       // shutdown the replica manager upon test completion
       replicaManager.shutdown(false)
+      quotaManager.shutdown()
       metrics.close()
       scheduler.shutdown()
     }

@@ -19,6 +19,7 @@ package org.apache.kafka.streams;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
@@ -99,6 +100,7 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -116,7 +118,7 @@ import static org.apache.kafka.streams.processor.internals.StreamThread.Processi
  * Best of all, the class works without a real Kafka broker, so the tests execute very quickly with very little overhead.
  * <p>
  * Using the {@code TopologyTestDriver} in tests is easy: simply instantiate the driver and provide a {@link Topology}
- * (cf. {@link StreamsBuilder#build()}) and {@link Properties configs}, {@link #createInputTopic(String, Serializer, Serializer) create}
+ * (cf. {@link StreamsBuilder#build()}) and {@link Properties config}, {@link #createInputTopic(String, Serializer, Serializer) create}
  * and use a {@link TestInputTopic} to supply an input records to the topology,
  * and then {@link #createOutputTopic(String, Deserializer, Deserializer) create} and use a {@link TestOutputTopic} to read and
  * verify any output records by the topology.
@@ -130,12 +132,11 @@ import static org.apache.kafka.streams.processor.internals.StreamThread.Processi
  * In order to create a {@code TopologyTestDriver} instance, you need a {@link Topology} and a {@link Properties config}.
  * The configuration needs to be representative of what you'd supply to the real topology, so that means including
  * several key properties (cf. {@link StreamsConfig}).
- * For example, the following code fragment creates a configuration that specifies a local Kafka broker list (which is
- * needed but not used), a timestamp extractor, and default serializers and deserializers for string keys and values:
+ * For example, the following code fragment creates a configuration that specifies a timestamp extractor,
+ * default serializers and deserializers for string keys and values:
  *
  * <pre>{@code
  * Properties props = new Properties();
- * props.setProperty(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9091");
  * props.setProperty(StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, CustomTimestampExtractor.class.getName());
  * props.setProperty(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
  * props.setProperty(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
@@ -245,6 +246,16 @@ public class TopologyTestDriver implements Closeable {
 
     /**
      * Create a new test diver instance.
+     * Default test properties are used to initialize the driver instance
+     *
+     * @param topology the topology to be tested
+     */
+    public TopologyTestDriver(final Topology topology) {
+        this(topology, new Properties());
+    }
+
+    /**
+     * Create a new test diver instance.
      * Initialized the internally mocked wall-clock time with {@link System#currentTimeMillis() current system time}.
      *
      * @param topology the topology to be tested
@@ -254,6 +265,18 @@ public class TopologyTestDriver implements Closeable {
                               final Properties config) {
         this(topology, config, null);
     }
+
+    /**
+     * Create a new test diver instance.
+     *
+     * @param topology the topology to be tested
+     * @param initialWallClockTimeMs the initial value of internally mocked wall-clock time
+     */
+    public TopologyTestDriver(final Topology topology,
+                              final Instant initialWallClockTimeMs) {
+        this(topology, new Properties(), initialWallClockTimeMs);
+    }
+
 
     /**
      * Create a new test diver instance.
@@ -299,12 +322,9 @@ public class TopologyTestDriver implements Closeable {
                                final long initialWallClockTimeMs) {
         final Properties configCopy = new Properties();
         configCopy.putAll(config);
-        if (!configCopy.containsKey(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG)) {
-            configCopy.setProperty(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy-bootstrap-host:0");
-        }
-        if (!configCopy.containsKey(StreamsConfig.APPLICATION_ID_CONFIG)) {
-            configCopy.setProperty(StreamsConfig.APPLICATION_ID_CONFIG, "dummy-topology-test-driver-app-id");
-        }
+        configCopy.putIfAbsent(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy-bootstrap-host:0");
+        // provide randomized dummy app-id if it's not specified
+        configCopy.putIfAbsent(StreamsConfig.APPLICATION_ID_CONFIG,  "dummy-topology-test-driver-app-id-" + ThreadLocalRandom.current().nextInt());
         final StreamsConfig streamsConfig = new ClientUtils.QuietStreamsConfig(configCopy);
         logIfTaskIdleEnabled(streamsConfig);
 
@@ -506,11 +526,21 @@ public class TopologyTestDriver implements Closeable {
                 mockWallClockTime,
                 stateManager,
                 recordCollector,
-                context
-            );
+                context,
+                logContext);
             task.initializeIfNeeded();
             task.completeRestoration();
             task.processorContext().setRecordContext(null);
+
+            // initialize the task metadata so that all topics have zero lag
+            for (final Map.Entry<TopicPartition, Long> entry : startOffsets.entrySet()) {
+                final ConsumerRecords.Metadata metadata = new ConsumerRecords.Metadata(
+                    mockWallClockTime.milliseconds(),
+                    0L,
+                    0L
+                );
+                task.addFetchedMetadata(entry.getKey(), metadata);
+            }
         } else {
             task = null;
         }
@@ -572,10 +602,11 @@ public class TopologyTestDriver implements Closeable {
                                    final byte[] key,
                                    final byte[] value,
                                    final Headers headers) {
+        final long offset = offsetsByTopicOrPatternPartition.get(topicOrPatternPartition).incrementAndGet() - 1;
         task.addRecords(topicOrPatternPartition, Collections.singleton(new ConsumerRecord<>(
             inputTopic,
             topicOrPatternPartition.partition(),
-            offsetsByTopicOrPatternPartition.get(topicOrPatternPartition).incrementAndGet() - 1,
+            offset,
             timestamp,
             TimestampType.CREATE_TIME,
             (long) ConsumerRecord.NULL_CHECKSUM,
@@ -585,6 +616,12 @@ public class TopologyTestDriver implements Closeable {
             value,
             headers))
         );
+        final ConsumerRecords.Metadata metadata = new ConsumerRecords.Metadata(
+            mockWallClockTime.milliseconds(),
+            offset,
+            offset
+        );
+        task.addFetchedMetadata(topicOrPatternPartition, metadata);
     }
 
     private void completeAllProcessableWork() {

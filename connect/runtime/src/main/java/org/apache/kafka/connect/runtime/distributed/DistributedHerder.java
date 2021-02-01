@@ -93,6 +93,7 @@ import java.util.stream.Collectors;
 import static org.apache.kafka.connect.runtime.WorkerConfig.TOPIC_TRACKING_ENABLE_CONFIG;
 import static org.apache.kafka.connect.runtime.distributed.ConnectProtocol.CONNECT_PROTOCOL_V0;
 import static org.apache.kafka.connect.runtime.distributed.ConnectProtocolCompatibility.EAGER;
+import static org.apache.kafka.connect.runtime.distributed.IncrementalCooperativeConnectProtocol.CONNECT_PROTOCOL_V1;
 import static org.apache.kafka.connect.runtime.distributed.IncrementalCooperativeConnectProtocol.CONNECT_PROTOCOL_V2;
 
 /**
@@ -751,14 +752,8 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
     @Override
     public void connectorConfig(String connName, final Callback<Map<String, String>> callback) {
-        // Subset of connectorInfo, so piggy back on that implementation
         log.trace("Submitting connector config read request {}", connName);
-        connectorInfo(connName, (error, result) -> {
-            if (error != null)
-                callback.onCompletion(error, null);
-            else
-                callback.onCompletion(null, result.config());
-        });
+        super.connectorConfig(connName, callback);
     }
 
     @Override
@@ -1301,7 +1296,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         final TargetState initialState = configState.targetState(connectorName);
         final Callback<TargetState> onInitialStateChange = (error, newState) -> {
             if (error != null) {
-                callback.onCompletion(new ConnectException("Failed to start connector: " + connectorName), null);
+                callback.onCompletion(new ConnectException("Failed to start connector: " + connectorName, error), null);
                 return;
             }
 
@@ -1371,9 +1366,9 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                 // from the HTTP request forwarding thread.
                 if (error != null) {
                     if (isPossibleExpiredKeyException(initialRequestTime, error)) {
-                        log.debug("Failed to reconfigure connector's tasks, possibly due to expired session key. Retrying after backoff");
+                        log.debug("Failed to reconfigure connector's tasks ({}), possibly due to expired session key. Retrying after backoff", connName);
                     } else {
-                        log.error("Failed to reconfigure connector's tasks, retrying after backoff:", error);
+                        log.error("Failed to reconfigure connector's tasks ({}), retrying after backoff:", connName, error);
                     }
                     addRequest(RECONFIGURE_CONNECTOR_TASKS_BACKOFF_MS,
                             new Callable<Void>() {
@@ -1746,7 +1741,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             // Note that since we don't reset the assignment, we don't revoke leadership here. During a rebalance,
             // it is still important to have a leader that can write configs, offsets, etc.
 
-            if (rebalanceResolved) {
+            if (rebalanceResolved || currentProtocolVersion >= CONNECT_PROTOCOL_V1) {
                 List<Callable<Void>> callables = new ArrayList<>();
                 for (final String connectorName : connectors) {
                     callables.add(getConnectorStoppingCallable(connectorName));
