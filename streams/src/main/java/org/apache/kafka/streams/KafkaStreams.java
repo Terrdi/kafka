@@ -92,12 +92,12 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.function.Predicate;
 
 import static org.apache.kafka.streams.StreamsConfig.METRICS_RECORDING_LEVEL_CONFIG;
 import static org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse.SHUTDOWN_CLIENT;
@@ -463,9 +463,8 @@ public class KafkaStreams implements AutoCloseable {
             closeToError();
         }
         final StreamThread deadThread = (StreamThread) Thread.currentThread();
-        threads.remove(deadThread);
-        addStreamThread();
         deadThread.shutdown();
+        addStreamThread();
         if (throwable instanceof RuntimeException) {
             throw (RuntimeException) throwable;
         } else if (throwable instanceof Error) {
@@ -499,7 +498,7 @@ public class KafkaStreams implements AutoCloseable {
                             "longer in a well-defined state. Attempting to send the shutdown command anyway.", throwable);
                 }
 
-                if (Thread.currentThread().equals(globalStreamThread) && countStreamThread(StreamThread::isRunning) == 0) {
+                if (Thread.currentThread().equals(globalStreamThread) && getNumLiveStreamThreads() == 0) {
                     log.error("Exception in global thread caused the application to attempt to shutdown." +
                             " This action will succeed only if there is at least one StreamThread running on this client." +
                             " Currently there are no running threads so will now close the client.");
@@ -787,8 +786,27 @@ public class KafkaStreams implements AutoCloseable {
                          final Time time) throws StreamsException {
         this.config = config;
         this.time = time;
+
+        this.internalTopologyBuilder = internalTopologyBuilder;
+        internalTopologyBuilder.rewriteTopology(config);
+
+        // sanity check to fail-fast in case we cannot build a ProcessorTopology due to an exception
+        taskTopology = internalTopologyBuilder.buildTopology();
+        globalTaskTopology = internalTopologyBuilder.buildGlobalStateTopology();
+
+        final boolean hasGlobalTopology = globalTaskTopology != null;
+        final boolean hasPersistentStores = taskTopology.hasPersistentLocalStore() ||
+            (hasGlobalTopology && globalTaskTopology.hasPersistentGlobalStore());
+
+        try {
+            stateDirectory = new StateDirectory(config, time, hasPersistentStores);
+            processId = stateDirectory.initializeProcessId();
+        } catch (final ProcessorStateException fatal) {
+            throw new StreamsException(fatal);
+        }
+
+
         // The application ID is a required config and hence should always have value
-        processId = UUID.randomUUID();
         final String userClientId = config.getString(StreamsConfig.CLIENT_ID_CONFIG);
         final String applicationId = config.getString(StreamsConfig.APPLICATION_ID_CONFIG);
         if (userClientId.length() <= 0) {
@@ -798,73 +816,41 @@ public class KafkaStreams implements AutoCloseable {
         }
         final LogContext logContext = new LogContext(String.format("stream-client [%s] ", clientId));
         this.log = logContext.logger(getClass());
+
+        // use client id instead of thread client id since this admin client may be shared among threads
         this.clientSupplier = clientSupplier;
-        final MetricConfig metricConfig = new MetricConfig()
-            .samples(config.getInt(StreamsConfig.METRICS_NUM_SAMPLES_CONFIG))
-            .recordLevel(Sensor.RecordingLevel.forName(config.getString(StreamsConfig.METRICS_RECORDING_LEVEL_CONFIG)))
-            .timeWindow(config.getLong(StreamsConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS);
-        final List<MetricsReporter> reporters = config.getConfiguredInstances(StreamsConfig.METRIC_REPORTER_CLASSES_CONFIG,
-                MetricsReporter.class,
-                Collections.singletonMap(StreamsConfig.CLIENT_ID_CONFIG, clientId));
-        final JmxReporter jmxReporter = new JmxReporter();
-        jmxReporter.configure(config.originals());
-        reporters.add(jmxReporter);
-        final MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX,
-                config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX));
-        metrics = new Metrics(metricConfig, reporters, time, metricsContext);
+        adminClient = clientSupplier.getAdmin(config.getAdminConfigs(ClientUtils.getSharedAdminClientId(clientId)));
+
+        log.info("Kafka Streams version: {}", ClientMetrics.version());
+        log.info("Kafka Streams commit ID: {}", ClientMetrics.commitId());
+
+        metrics = getMetrics(config, time, clientId);
         streamsMetrics = new StreamsMetricsImpl(
             metrics,
             clientId,
             config.getString(StreamsConfig.BUILT_IN_METRICS_VERSION_CONFIG),
             time
         );
+
         ClientMetrics.addVersionMetric(streamsMetrics);
         ClientMetrics.addCommitIdMetric(streamsMetrics);
         ClientMetrics.addApplicationIdMetric(streamsMetrics, config.getString(StreamsConfig.APPLICATION_ID_CONFIG));
         ClientMetrics.addTopologyDescriptionMetric(streamsMetrics, internalTopologyBuilder.describe().toString());
         ClientMetrics.addStateMetric(streamsMetrics, (metricsConfig, now) -> state);
-        log.info("Kafka Streams version: {}", ClientMetrics.version());
-        log.info("Kafka Streams commit ID: {}", ClientMetrics.commitId());
-        this.internalTopologyBuilder = internalTopologyBuilder;
-        // re-write the physical topology according to the config
-        internalTopologyBuilder.rewriteTopology(config);
+        ClientMetrics.addNumAliveStreamThreadMetric(streamsMetrics, (metricsConfig, now) -> getNumLiveStreamThreads());
 
-        // sanity check to fail-fast in case we cannot build a ProcessorTopology due to an exception
-        taskTopology = internalTopologyBuilder.buildTopology();
         streamsMetadataState = new StreamsMetadataState(
-                internalTopologyBuilder,
-                parseHostInfo(config.getString(StreamsConfig.APPLICATION_SERVER_CONFIG)));
+            internalTopologyBuilder,
+            parseHostInfo(config.getString(StreamsConfig.APPLICATION_SERVER_CONFIG)));
 
-        final int numStreamThreads;
-        if (internalTopologyBuilder.hasNoNonGlobalTopology()) {
-            log.info("Overriding number of StreamThreads to zero for global-only topology");
-            numStreamThreads = 0;
-        } else {
-            numStreamThreads = config.getInt(StreamsConfig.NUM_STREAM_THREADS_CONFIG);
-        }
-
-        // create the stream thread, global update thread, and cleanup thread
-        threads = Collections.synchronizedList(new LinkedList<>());
-        globalTaskTopology = internalTopologyBuilder.buildGlobalStateTopology();
-        final boolean hasGlobalTopology = globalTaskTopology != null;
-
-        if (numStreamThreads == 0 && !hasGlobalTopology) {
-            log.error("Topology with no input topics will create no stream threads and no global thread.");
-            throw new TopologyException("Topology has no stream threads and no global threads, " +
-                "must subscribe to at least one source topic or global table.");
-        }
         oldHandler = false;
-        totalCacheSize = config.getLong(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG);
-        final long cacheSizePerThread = getCacheSizePerThread(numStreamThreads);
-        final boolean hasPersistentStores = taskTopology.hasPersistentLocalStore() ||
-                (hasGlobalTopology && globalTaskTopology.hasPersistentGlobalStore());
         streamsUncaughtExceptionHandler = this::defaultStreamsUncaughtExceptionHandler;
-        try {
-            stateDirectory = new StateDirectory(config, time, hasPersistentStores);
-        } catch (final ProcessorStateException fatal) {
-            throw new StreamsException(fatal);
-        }
         delegatingStateRestoreListener = new DelegatingStateRestoreListener();
+
+        totalCacheSize = config.getLong(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG);
+        final int numStreamThreads = getNumStreamThreads(hasGlobalTopology);
+        final long cacheSizePerThread = getCacheSizePerThread(numStreamThreads);
+
         GlobalStreamThread.State globalThreadState = null;
         if (hasGlobalTopology) {
             final String globalThreadId = clientId + "-GlobalStreamThread";
@@ -883,23 +869,20 @@ public class KafkaStreams implements AutoCloseable {
             globalThreadState = globalStreamThread.state();
         }
 
-        // use client id instead of thread client id since this admin client may be shared among threads
-        adminClient = clientSupplier.getAdmin(config.getAdminConfigs(ClientUtils.getSharedAdminClientId(clientId)));
-
+        threads = Collections.synchronizedList(new LinkedList<>());
         threadState = new HashMap<>(numStreamThreads);
-        storeProviders = new ArrayList<>();
         streamStateListener = new StreamStateListener(threadState, globalThreadState);
+
+        final GlobalStateStoreProvider globalStateStoreProvider = new GlobalStateStoreProvider(internalTopologyBuilder.globalStateStores());
+
         if (hasGlobalTopology) {
             globalStreamThread.setStateListener(streamStateListener);
         }
+
+        storeProviders = new ArrayList<>();
         for (int i = 1; i <= numStreamThreads; i++) {
             createAndAddStreamThread(cacheSizePerThread, i);
         }
-
-        ClientMetrics.addNumAliveStreamThreadMetric(streamsMetrics, (metricsConfig, now) ->
-            Math.toIntExact(countStreamThread(thread -> thread.state().isAlive())));
-
-        final GlobalStateStoreProvider globalStateStoreProvider = new GlobalStateStoreProvider(internalTopologyBuilder.globalStateStores());
         queryableStoreProvider = new QueryableStoreProvider(storeProviders, globalStateStoreProvider);
 
         stateDirCleaner = setupStateDirCleaner();
@@ -932,6 +915,39 @@ public class KafkaStreams implements AutoCloseable {
         return streamThread;
     }
 
+    private static Metrics getMetrics(final StreamsConfig config, final Time time, final String clientId) {
+        final MetricConfig metricConfig = new MetricConfig()
+            .samples(config.getInt(StreamsConfig.METRICS_NUM_SAMPLES_CONFIG))
+            .recordLevel(Sensor.RecordingLevel.forName(config.getString(StreamsConfig.METRICS_RECORDING_LEVEL_CONFIG)))
+            .timeWindow(config.getLong(StreamsConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS);
+        final List<MetricsReporter> reporters = config.getConfiguredInstances(StreamsConfig.METRIC_REPORTER_CLASSES_CONFIG,
+                                                                              MetricsReporter.class,
+                                                                              Collections.singletonMap(StreamsConfig.CLIENT_ID_CONFIG, clientId));
+        final JmxReporter jmxReporter = new JmxReporter();
+        jmxReporter.configure(config.originals());
+        reporters.add(jmxReporter);
+        final MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX,
+                                                                      config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX));
+        return new Metrics(metricConfig, reporters, time, metricsContext);
+    }
+
+    private int getNumStreamThreads(final boolean hasGlobalTopology) {
+        final int numStreamThreads;
+        if (internalTopologyBuilder.hasNoNonGlobalTopology()) {
+            log.info("Overriding number of StreamThreads to zero for global-only topology");
+            numStreamThreads = 0;
+        } else {
+            numStreamThreads = config.getInt(StreamsConfig.NUM_STREAM_THREADS_CONFIG);
+        }
+
+        if (numStreamThreads == 0 && !hasGlobalTopology) {
+            log.error("Topology with no input topics will create no stream threads and no global thread.");
+            throw new TopologyException("Topology has no stream threads and no global threads, " +
+                                            "must subscribe to at least one source topic or global table.");
+        }
+        return numStreamThreads;
+    }
+
     /**
      * Adds and starts a stream thread in addition to the stream threads that are already running in this
      * Kafka Streams client.
@@ -947,12 +963,13 @@ public class KafkaStreams implements AutoCloseable {
      */
     public Optional<String> addStreamThread() {
         if (isRunningOrRebalancing()) {
-            final int threadIdx;
-            final long cacheSizePerThread;
             final StreamThread streamThread;
             synchronized (changeThreadCount) {
-                threadIdx = getNextThreadIndex();
-                cacheSizePerThread = getCacheSizePerThread(threads.size() + 1);
+                final int threadIdx = getNextThreadIndex();
+                final int numLiveThreads = getNumLiveStreamThreads();
+                final long cacheSizePerThread = getCacheSizePerThread(numLiveThreads + 1);
+                log.info("Adding StreamThread-{}, there will now be {} live threads and the new cache size per thread is {}",
+                         threadIdx, numLiveThreads + 1, cacheSizePerThread);
                 resizeThreadCache(cacheSizePerThread);
                 // Creating thread should hold the lock in order to avoid duplicate thread index.
                 // If the duplicate index happen, the metadata of thread may be duplicate too.
@@ -964,14 +981,19 @@ public class KafkaStreams implements AutoCloseable {
                     streamThread.start();
                     return Optional.of(streamThread.getName());
                 } else {
+                    log.warn("Terminating the new thread because the Kafka Streams client is in state {}", state);
                     streamThread.shutdown();
                     threads.remove(streamThread);
-                    resizeThreadCache(getCacheSizePerThread(threads.size()));
+                    final long cacheSizePerThread = getCacheSizePerThread(getNumLiveStreamThreads());
+                    log.info("Resizing thread cache due to terminating added thread, new cache size per thread is {}", cacheSizePerThread);
+                    resizeThreadCache(cacheSizePerThread);
+                    return Optional.empty();
                 }
             }
+        } else {
+            log.warn("Cannot add a stream thread when Kafka Streams client is in state {}", state);
+            return Optional.empty();
         }
-        log.warn("Cannot add a stream thread when Kafka Streams client is in state  " + state());
-        return Optional.empty();
     }
 
     /**
@@ -1013,26 +1035,36 @@ public class KafkaStreams implements AutoCloseable {
     }
 
     private Optional<String> removeStreamThread(final long timeoutMs) throws TimeoutException {
-        final long begin = time.milliseconds();
-        boolean timeout = false;
+        final long startMs = time.milliseconds();
+
         if (isRunningOrRebalancing()) {
             synchronized (changeThreadCount) {
                 // make a copy of threads to avoid holding lock
                 for (final StreamThread streamThread : new ArrayList<>(threads)) {
                     final boolean callingThreadIsNotCurrentStreamThread = !streamThread.getName().equals(Thread.currentThread().getName());
-                    if (streamThread.isAlive() && (callingThreadIsNotCurrentStreamThread || threads.size() == 1)) {
+                    if (streamThread.isAlive() && (callingThreadIsNotCurrentStreamThread || getNumLiveStreamThreads() == 1)) {
                         log.info("Removing StreamThread " + streamThread.getName());
                         final Optional<String> groupInstanceID = streamThread.getGroupInstanceID();
                         streamThread.requestLeaveGroupDuringShutdown();
                         streamThread.shutdown();
                         if (!streamThread.getName().equals(Thread.currentThread().getName())) {
-                            if (!streamThread.waitOnThreadState(StreamThread.State.DEAD, timeoutMs - begin)) {
-                                log.warn("Thread " + streamThread.getName() + " did not shutdown in the allotted time");
-                                timeout = true;
+                            final long remainingTimeMs = timeoutMs - (time.milliseconds() - startMs);
+                            if (remainingTimeMs <= 0 || !streamThread.waitOnThreadState(StreamThread.State.DEAD, remainingTimeMs)) {
+                                log.warn("{} did not shutdown in the allotted time.", streamThread.getName());
+                                // Don't remove from threads until shutdown is complete. We will trim it from the
+                                // list once it reaches DEAD, and if for some reason it's hanging indefinitely in the
+                                // shutdown then we should just consider this thread.id to be burned
+                            } else {
+                                log.info("Successfully removed {} in {}ms", streamThread.getName(), time.milliseconds() - startMs);
+                                threads.remove(streamThread);
                             }
+                        } else {
+                            log.info("{} is the last remaining thread and must remove itself, therefore we cannot wait "
+                                + "for it to complete shutdown as this will result in deadlock.", streamThread.getName());
                         }
-                        threads.remove(streamThread);
-                        final long cacheSizePerThread = getCacheSizePerThread(threads.size());
+
+                        final long cacheSizePerThread = getCacheSizePerThread(getNumLiveStreamThreads());
+                        log.info("Resizing thread cache due to thread removal, new cache size per thread is {}", cacheSizePerThread);
                         resizeThreadCache(cacheSizePerThread);
                         if (groupInstanceID.isPresent() && callingThreadIsNotCurrentStreamThread) {
                             final MemberToRemove memberToRemove = new MemberToRemove(groupInstanceID.get());
@@ -1043,7 +1075,8 @@ public class KafkaStreams implements AutoCloseable {
                                     new RemoveMembersFromConsumerGroupOptions(membersToRemove)
                                 );
                             try {
-                                removeMembersFromConsumerGroupResult.memberResult(memberToRemove).get(timeoutMs - begin, TimeUnit.MILLISECONDS);
+                                final long remainingTimeMs = timeoutMs - (time.milliseconds() - startMs);
+                                removeMembersFromConsumerGroupResult.memberResult(memberToRemove).get(remainingTimeMs, TimeUnit.MILLISECONDS);
                             } catch (final java.util.concurrent.TimeoutException e) {
                                 log.error("Could not remove static member {} from consumer group {} due to a timeout: {}",
                                         groupInstanceID.get(), config.getString(StreamsConfig.APPLICATION_ID_CONFIG), e);
@@ -1061,7 +1094,8 @@ public class KafkaStreams implements AutoCloseable {
                                 );
                             }
                         }
-                        if (timeout) {
+                        final long remainingTimeMs = timeoutMs - (time.milliseconds() - startMs);
+                        if (remainingTimeMs <= 0) {
                             throw new TimeoutException("Thread " + streamThread.getName() + " did not stop in the allotted time");
                         }
                         return Optional.of(streamThread.getName());
@@ -1075,17 +1109,63 @@ public class KafkaStreams implements AutoCloseable {
         return Optional.empty();
     }
 
-    private int getNextThreadIndex() {
-        final HashSet<String> names = new HashSet<>();
-        processStreamThread(thread -> names.add(thread.getName()));
-        final String baseName = clientId + "-StreamThread-";
-        for (int i = 1; i <= threads.size(); i++) {
-            final String name = baseName + i;
-            if (!names.contains(name)) {
-                return i;
-            }
+    /**
+     * Takes a snapshot and counts the number of stream threads which are not in PENDING_SHUTDOWN or DEAD
+     *
+     * note: iteration over SynchronizedList is not thread safe so it must be manually synchronized. However, we may
+     * require other locks when looping threads and it could cause deadlock. Hence, we create a copy to avoid holding
+     * threads lock when looping threads.
+     * @return number of alive stream threads
+     */
+    private int getNumLiveStreamThreads() {
+        final AtomicInteger numLiveThreads = new AtomicInteger(0);
+
+        synchronized (threads) {
+            processStreamThread(thread -> {
+                if (thread.state() == StreamThread.State.DEAD) {
+                    log.debug("Trimming thread {} from the threads list since it's state is {}", thread.getName(), StreamThread.State.DEAD);
+                    threads.remove(thread);
+                } else if (thread.state() == StreamThread.State.PENDING_SHUTDOWN) {
+                    log.debug("Skipping thread {} from num live threads computation since it's state is {}",
+                              thread.getName(), StreamThread.State.PENDING_SHUTDOWN);
+                } else {
+                    numLiveThreads.incrementAndGet();
+                }
+            });
+            return numLiveThreads.get();
         }
-        return threads.size() + 1;
+    }
+
+    private int getNextThreadIndex() {
+        final HashSet<String> allLiveThreadNames = new HashSet<>();
+        final AtomicInteger maxThreadId = new AtomicInteger(1);
+        synchronized (threads) {
+            processStreamThread(thread -> {
+                // trim any DEAD threads from the list so we can reuse the thread.id
+                // this is only safe to do once the thread has fully completed shutdown
+                if (thread.state() == StreamThread.State.DEAD) {
+                    threads.remove(thread);
+                } else {
+                    allLiveThreadNames.add(thread.getName());
+                    // Assume threads are always named with the "-StreamThread-<threadId>" suffix
+                    final int threadId = Integer.parseInt(thread.getName().substring(thread.getName().lastIndexOf("-") + 1));
+                    if (threadId > maxThreadId.get()) {
+                        maxThreadId.set(threadId);
+                    }
+                }
+            });
+
+            final String baseName = clientId + "-StreamThread-";
+            for (int i = 1; i <= maxThreadId.get(); i++) {
+                final String name = baseName + i;
+                if (!allLiveThreadNames.contains(name)) {
+                    return i;
+                }
+            }
+            // It's safe to use threads.size() rather than getNumLiveStreamThreads() to infer the number of threads
+            // here since we trimmed any DEAD threads earlier in this method while holding the lock
+            return threads.size() + 1;
+        }
     }
 
     private long getCacheSizePerThread(final int numStreamThreads) {
@@ -1263,6 +1343,7 @@ public class KafkaStreams implements AutoCloseable {
                 globalStreamThread = null;
             }
 
+            stateDirectory.close();
             adminClient.close();
 
             streamsMetrics.removeAllClientLevelSensorsAndMetrics();
@@ -1276,24 +1357,29 @@ public class KafkaStreams implements AutoCloseable {
     }
 
     private boolean close(final long timeoutMs) {
-        if (state == State.ERROR) {
-            log.info("Streams client is already in the terminal state ERROR, all resources are closed and the client has stopped.");
+        if (state == State.ERROR || state == State.NOT_RUNNING) {
+            log.info("Streams client is already in the terminal {} state, all resources are closed and the client has stopped.", state);
             return true;
         }
-        if (state == State.PENDING_ERROR) {
-            log.info("Streams client is in PENDING_ERROR, all resources are being closed and the client will be stopped.");
-            if (waitOnState(State.ERROR, timeoutMs)) {
+        if (state == State.PENDING_ERROR || state == State.PENDING_SHUTDOWN) {
+            log.info("Streams client is in {}, all resources are being closed and the client will be stopped.", state);
+            if (state == State.PENDING_ERROR && waitOnState(State.ERROR, timeoutMs)) {
                 log.info("Streams client stopped to ERROR completely");
                 return true;
+            } else if (state == State.PENDING_SHUTDOWN && waitOnState(State.NOT_RUNNING, timeoutMs)) {
+                log.info("Streams client stopped to NOT_RUNNING completely");
+                return true;
             } else {
-                log.info("Streams client cannot transition to ERROR completely within the timeout");
+                log.warn("Streams client cannot transition to {}} completely within the timeout",
+                         state == State.PENDING_SHUTDOWN ? State.NOT_RUNNING : State.ERROR);
                 return false;
             }
         }
+
         if (!setState(State.PENDING_SHUTDOWN)) {
-            // if transition failed, it means it was either in PENDING_SHUTDOWN
-            // or NOT_RUNNING already; just check that all threads have been stopped
-            log.info("Already in the pending shutdown state, wait to complete shutdown");
+            // if we can't transition to PENDING_SHUTDOWN but not because we're already shutting down, then it must be fatal
+            log.error("Failed to transition to PENDING_SHUTDOWN, current state is {}", state);
+            throw new StreamsException("Failed to shut down while in state " + state);
         } else {
             final Thread shutdownThread = shutdownHelper(false);
 
@@ -1556,25 +1642,11 @@ public class KafkaStreams implements AutoCloseable {
     }
 
     /**
-     * count the snapshot of threads.
-     * noted: iteration over SynchronizedList is not thread safe so it must be manually synchronized. However, we may
-     * require other locks when looping threads and it could cause deadlock. Hence, we create a copy to avoid holding
-     * threads lock when looping threads.
-     * @param predicate predicate
-     * @return number of matched threads
-     */
-    private long countStreamThread(final Predicate<StreamThread> predicate) {
-        final List<StreamThread> copy = new ArrayList<>(threads);
-        return copy.stream().filter(predicate).count();
-    }
-
-    /**
      * Returns runtime information about the local threads of this {@link KafkaStreams} instance.
      *
      * @return the set of {@link ThreadMetadata}.
      */
     public Set<ThreadMetadata> localThreadsMetadata() {
-        validateIsRunningOrRebalancing();
         final Set<ThreadMetadata> threadMetadata = new HashSet<>();
         processStreamThread(thread -> {
             synchronized (thread.getStateLock()) {
