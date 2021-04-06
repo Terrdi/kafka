@@ -42,6 +42,7 @@ import org.apache.kafka.common.utils.Utils
   * Methods of this class are thread safe. Make sure to check `AbstractIndex` subclasses
   * documentation to establish their thread safety.
   *
+  * 定义了{@link AbstractIndex}上的一个包装类，实现索引项的延迟加载。这个类主要是为了提高性能
   * @param loadIndex A function that takes a `File` pointing to an index and returns a loaded
   *                  `AbstractIndex` instance.
   */

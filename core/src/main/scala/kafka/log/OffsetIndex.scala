@@ -48,6 +48,9 @@ import org.apache.kafka.common.errors.InvalidOffsetException
  *
  * All external APIs translate from relative offsets to full offsets, so users of this class do not interact with the internal
  * storage format.
+ *
+ * 每当Consumer 需要从主题分区的某个位置开始读取消息时，Kafka 就会用到 OffsetIndex 直接定位物理文件位置，从而避免了因为从头读取消息而引入的昂贵的I/O操作
+ * 定义位移索引， 保存 < 位移值, 文件磁盘物理位置 > 对
  */
 // Avoid shadowing mutable `file` in AbstractIndex
 class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable: Boolean = true)
@@ -87,11 +90,14 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
    */
   def lookup(targetOffset: Long): OffsetPosition = {
     maybeLock(lock) {
-      val idx = mmap.duplicate
+      val idx = mmap.duplicate // 使用私有变量复制出整个索引映射区
+      // largestLowerBoundSlotFor 方法底层使用了改进版的二分查找算法寻找对应的槽
       val slot = largestLowerBoundSlotFor(idx, targetOffset, IndexSearchType.KEY)
+      // 如果没找到，返回一个空的位置，即物理文件位置从0开始，表示从头读日志文件
       if(slot == -1)
         OffsetPosition(baseOffset, 0)
       else
+        // 否则返回 slot 槽对应的索引项
         parseEntry(idx, slot)
     }
   }
@@ -112,11 +118,17 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
     }
   }
 
+  // 计算相对位移
   private def relativeOffset(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * entrySize)
 
+  // 计算物理磁盘位置
   private def physical(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * entrySize + 4)
 
   override protected def parseEntry(buffer: ByteBuffer, n: Int): OffsetPosition = {
+    // OffsetPosition 是实现 IndexEntry 的实现类
+    // Key 是位移值, value 是物理磁盘位置
+    // 当读取offset时，源码还需要将相对位移还原成之前的完整位移 baseOffset + relativeOffset(buffer, n)
+    // Value是这个位移值上消息在日志段文件中的物理位置，代码调用 physical 方法计算这个物理位置并把它作为Value
     OffsetPosition(baseOffset + relativeOffset(buffer, n), physical(buffer, n))
   }
 
@@ -136,19 +148,27 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
 
   /**
    * Append an entry for the given offset/location pair to the index. This entry must have a larger offset than all subsequent entries.
-   * @throws IndexOffsetOverflowException if the offset causes index offset to overflow
+   * 写入索引项
+   * @throws InvalidOffsetException if the offset causes index offset to overflow
    */
   def append(offset: Long, position: Int): Unit = {
     inLock(lock) {
+      // 1.判断索引文件未满
       require(!isFull, "Attempt to append to a full index (size = " + _entries + ").")
+      // 2. 必须满足以下条件之一才允许写入索引项:
+      // 1⃣️ 当前索引文件为空
+      // 2⃣️ 要写入的位移大于当前所有已写入的索引项的位移—— Kafka 规定索引项中的位移值必须是单调增加的
       if (_entries == 0 || offset > _lastOffset) {
         trace(s"Adding index entry $offset => $position to ${file.getAbsolutePath}")
-        mmap.putInt(relativeOffset(offset))
-        mmap.putInt(position)
+        mmap.putInt(relativeOffset(offset)) // 3. 向mmap中写入相对位移值
+        mmap.putInt(position) // 4. 向mmap中写入物理位置信息
+        // 5. 更新其它元数据统计信息，如当前索引项计数器_entries和当前索引的最新位移值_lastOffset
         _entries += 1
         _lastOffset = offset
+        // 6. 执行校验。写入的索引项格式必须符合要求，即索引项个数*单个索引项占用字节数匹配当前文件的物理大小，否则说明文件已损坏
         require(_entries * entrySize == mmap.position(), s"$entries entries but file position in index is ${mmap.position()}.")
       } else {
+        // 不满足 2 的写入索引项条件
         throw new InvalidOffsetException(s"Attempt to append an offset ($offset) to position $entries no larger than" +
           s" the last offset appended (${_lastOffset}) to ${file.getAbsolutePath}.")
       }
@@ -180,6 +200,7 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
 
   /**
    * Truncates index to a known number of entries.
+   * 截断操作：将索引文件内容直接裁剪掉一部分，保留前 entries 个索引项
    */
   private def truncateToEntries(entries: Int): Unit = {
     inLock(lock) {

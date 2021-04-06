@@ -83,6 +83,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * various getters. These are reset by each call to <code>poll()</code>.
  *
  * This class is not thread safe!
+ *
+ * 社区提供的一个基于 Java NIO Selector 的接口，用于执行非阻塞多通道的网络 I/O 操作
+ * 在核心功能上， Kafka 提供的 Selector 和 Java 提供的是一致的
  */
 public class Selector implements Selectable, AutoCloseable {
 

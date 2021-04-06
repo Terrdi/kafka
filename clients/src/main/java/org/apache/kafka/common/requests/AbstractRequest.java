@@ -149,9 +149,17 @@ public abstract class AbstractRequest implements AbstractRequestResponse {
      */
     public static RequestAndSize parseRequest(ApiKeys apiKey, short apiVersion, ByteBuffer buffer) {
         int bufferSize = buffer.remaining();
+        // 封装解析后的请求对象以及请求大小返回
         return new RequestAndSize(doParseRequest(apiKey, apiVersion, buffer), bufferSize);
     }
 
+    /**
+     * 解析请求
+     * @param apiKey
+     * @param apiVersion
+     * @param buffer
+     * @return
+     */
     private static AbstractRequest doParseRequest(ApiKeys apiKey, short apiVersion, ByteBuffer buffer) {
         switch (apiKey) {
             case PRODUCE:

@@ -68,6 +68,54 @@ object KafkaController extends Logging {
   type UpdateFeaturesCallback = Either[ApiError, Map[String, ApiError]] => Unit
 }
 
+/**
+ * 为集群中的所有主题分区选举领导者副本
+ * 承载着集群的全部元数据信息，并负责把这些元数据信息同步到其他 Broker 上
+ *
+ * Controller 会给集群中所有 Broker (包括它自己所在的 Broker ) 机器发送网络请求
+ * 当前，Controller 只会向 Broker 发送三类请求，分别是 LeaderAndLsrRequest、StopReplicaRequest 和 UpdateMetadataRequest
+ *
+ * LeaderAndLsrRequest: 告诉 Broker 相关主题各个分区的Leader副本位于哪台 Broker 上、ISR中的副本都在哪些Broker上。
+ * 它应该被赋予最高的优先级，毕竟，它有令数据类请求直接失效的本领。
+ *
+ * StopReplicaRequest: 告知指定 Broker 停止它上面的副本对象，该请求甚至还能删除副本底层的日志数据。
+ * 这个请求主要的使用场景，是分区副本迁移和删除主题。 这两个场景都涉及停掉 Broker 上的副本操作。
+ *
+ * UpdateMetadataRequest: 该请求会更新 Broker 上的元数据缓存。集群上的所有元数据变更，都首先发生在 Controller 端，然后
+ * 再经由这个请求广播给集群上的所有 Broker。
+ *
+ * 社区越来越倾向于将重要的数据结构源代码从服务端的 core 工程移动到 clients 工程中。这三类请求 Java 类的定义就封装在 clients中，它们的抽象基类是 AbstractControlRequest 类。
+ * @see org.apache.kafka.common.requests.AbstractControlRequest
+ *
+ * Kafka 的元数据信息
+ * 暂时无法删除的Topic列表
+ * 正在删除中的Topic列表
+ * 待删除Topic列表
+ * 不可用路径上的副本列表
+ * 副本可用性状态汇总
+ * 分区可用性状态汇总
+ * 正在执行重分配的分区列表
+ * Topic分区Leader详情信息
+ * Controller 状态信息
+ * 不可用(离线)分区数量
+ * 关闭中Broker列表
+ * 运行中Broker列表
+ * 运行中Broker的Epoch
+ * Controller Epoch
+ * Controller Epoch Znode 的版本号
+ * 集群Topic列表
+ * Topic分别详情信息
+ * @param config
+ * @param zkClient
+ * @param time
+ * @param metrics
+ * @param initialBrokerInfo
+ * @param initialBrokerEpoch
+ * @param tokenManager
+ * @param brokerFeatures
+ * @param featureCache
+ * @param threadNamePrefix
+ */
 class KafkaController(val config: KafkaConfig,
                       zkClient: KafkaZkClient,
                       time: Time,
@@ -577,17 +625,26 @@ class KafkaController(val config: KafkaConfig,
   /*
    * This callback is invoked by the replica state machine's broker change listener with the list of failed brokers
    * as input. It will call onReplicaBecomeOffline(...) with the list of replicas on those failed brokers as input.
+   * 为关闭中的 Broker 执行清扫工作
+   * 该方法接收一组已终止运行的 Broker ID 列表，首先是更新 Controller 元数据信息，将给定 Broker 从
+   * 元数据的 replicasOnOfflineDirs 和 shuttingDownBrokerIds 中移除，然后为这组 Broker 执行必要的副本
+   * 清除工作， 也就是 onReplicasBecomeOffline 方法做的事情
    */
   private def onBrokerFailure(deadBrokers: Seq[Int]): Unit = {
     info(s"Broker failure callback for ${deadBrokers.mkString(",")}")
+    // deadBrokers: 给定的一组已终止运行的 Broker Id 列表
+    // 更新 Controller元数据信息，将 给定Broker 从元数据的 replicasOnOfflineDirs 中移除
     deadBrokers.foreach(controllerContext.replicasOnOfflineDirs.remove)
+    // 找出这些 Broker 上的所有副本对象
     val deadBrokersThatWereShuttingDown =
       deadBrokers.filter(id => controllerContext.shuttingDownBrokerIds.remove(id))
     if (deadBrokersThatWereShuttingDown.nonEmpty)
       info(s"Removed ${deadBrokersThatWereShuttingDown.mkString(",")} from list of shutting down brokers.")
+    // 执行副本清扫工作
     val allReplicasOnDeadBrokers = controllerContext.replicasOnBrokers(deadBrokers.toSet)
     onReplicasBecomeOffline(allReplicasOnDeadBrokers)
 
+    // 取消这些 Broker 上注册的 ZooKeeper 监听器
     unregisterBrokerModificationsHandler(deadBrokers)
   }
 
@@ -606,6 +663,11 @@ class KafkaController(val config: KafkaConfig,
     * Note that we don't need to refresh the leader/isr cache for all topic/partitions at this point. This is because
     * the partition state machine will refresh our cache for us when performing leader election for all new/offline
     * partitions coming online.
+    *
+    * 把给定的副本标记为 Offline 状态，即不可用状态
+    * 1. 利用分区状态机将给定副本所在的分区标记为 Offline 状态
+    * 2. 将集群上所有新分区和Offline分区状态变更为 Online 状态
+    * 3. 将相应的副本对象状态变更为 Offline
     */
   private def onReplicasBecomeOffline(newOfflineReplicas: Set[PartitionAndReplica]): Unit = {
     val (newOfflineReplicasForDeletion, newOfflineReplicasNotForDeletion) =
@@ -1491,8 +1553,8 @@ class KafkaController(val config: KafkaConfig,
     val wasActiveBeforeChange = isActive
     zkClient.registerZNodeChangeHandlerAndCheckExistence(controllerChangeHandler)
     activeControllerId = zkClient.getControllerId.getOrElse(-1)
-    if (wasActiveBeforeChange && !isActive) {
-      onControllerResignation()
+    if (wasActiveBeforeChange && !isActive) { // 如果 Controller 没有关闭
+      onControllerResignation() // 重新注册 Controller
     }
   }
 
@@ -2376,6 +2438,9 @@ class KafkaController(val config: KafkaConfig,
     }
   }
 
+  /**
+   * 处理主题变更
+   */
   private def processControllerChange(): Unit = {
     maybeResign()
   }
@@ -2577,8 +2642,10 @@ case class LeaderIsrAndControllerEpoch(leaderAndIsr: LeaderAndIsr, controllerEpo
 }
 
 private[controller] class ControllerStats extends KafkaMetricsGroup {
+  // 统计每秒发生的 Unclean Leader 选举次数
   val uncleanLeaderElectionRate = newMeter("UncleanLeaderElectionsPerSec", "elections", TimeUnit.SECONDS)
 
+  // Controller 事件通用的统计速率指标的方法
   val rateAndTimeMetrics: Map[ControllerState, KafkaTimer] = ControllerState.values.flatMap { state =>
     state.rateAndTimeMetricName.map { metricName =>
       state -> new KafkaTimer(newTimer(metricName, TimeUnit.MILLISECONDS, TimeUnit.SECONDS))

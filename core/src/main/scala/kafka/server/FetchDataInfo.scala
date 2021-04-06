@@ -25,6 +25,13 @@ case object FetchLogEnd extends FetchIsolation
 case object FetchHighWatermark extends FetchIsolation
 case object FetchTxnCommitted extends FetchIsolation
 
+/**
+ * 读取消息返回的POJO类
+ * @param fetchOffsetMetadata 消息的位移愿信息
+ * @param records 消息集合
+ * @param firstEntryIncomplete 第一条消息是否可以不完整
+ * @param abortedTransactions todo 事务
+ */
 case class FetchDataInfo(fetchOffsetMetadata: LogOffsetMetadata,
                          records: Records,
                          firstEntryIncomplete: Boolean = false,

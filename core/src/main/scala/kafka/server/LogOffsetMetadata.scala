@@ -38,11 +38,22 @@ object LogOffsetMetadata {
  *  2. the base message offset of the located segment
  *  3. the physical position on the located segment
  */
+/**
+ * POJO类 保存了三个重要的变量
+ * @param messageOffset 消息位移值 <=> 高水位值
+ * @param segmentBaseOffset 保存该位移值所在日志段的起始位移
+ *                          日志段起始位移值辅助计算两条消息在物理磁盘文件中位置的差值，即两条消息必须处在同一个日志段对象上，不能跨日志段对象。
+ *                          否则他们就位于不同的物理文件上，计算这个值就没有意义了
+ *
+ * @param relativePositionInSegment 保存该位移值所在日志段的物理磁盘位置 在计算两个位移值之间的物理磁盘差值时非常有用
+ *                                  例如 每次读取1MB的数据，那么源码肯定需要关心两个位移之间所有消息的总字节数是否超过了1MB
+ */
 case class LogOffsetMetadata(messageOffset: Long,
                              segmentBaseOffset: Long = Log.UnknownOffset,
                              relativePositionInSegment: Int = LogOffsetMetadata.UnknownFilePosition) {
 
   // check if this offset is already on an older segment compared with the given offset
+  // 当前位移所在日志段是否比that早
   def onOlderSegment(that: LogOffsetMetadata): Boolean = {
     if (messageOffsetOnly)
       throw new KafkaException(s"$this cannot compare its segment info with $that since it only has message offset info")
@@ -51,6 +62,7 @@ case class LogOffsetMetadata(messageOffset: Long,
   }
 
   // check if this offset is on the same segment with the given offset
+  // 当前位移和that是否在同一个日志段
   def onSameSegment(that: LogOffsetMetadata): Boolean = {
     if (messageOffsetOnly)
       throw new KafkaException(s"$this cannot compare its segment info with $that since it only has message offset info")
@@ -75,6 +87,7 @@ case class LogOffsetMetadata(messageOffset: Long,
   }
 
   // decide if the offset metadata only contains message offset info
+  // 日志偏移元数据是否完整
   def messageOffsetOnly: Boolean = {
     segmentBaseOffset == Log.UnknownOffset && relativePositionInSegment == LogOffsetMetadata.UnknownFilePosition
   }

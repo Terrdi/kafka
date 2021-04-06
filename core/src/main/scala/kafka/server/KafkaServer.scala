@@ -173,6 +173,8 @@ class KafkaServer(
   /**
    * Start up API for bringing up a single instance of the Kafka server.
    * Instantiates the LogManager, the SocketServer and the request handlers - KafkaRequestHandlers
+   *
+   * Processor 和 Acceptor 线程是在启动 SocketServer 组件之后启动的
    */
   override def startup(): Unit = {
     try {
@@ -286,7 +288,9 @@ class KafkaServer(
         //
         // Note that we allow the use of self-managed mode controller APIs when forwarding is enabled
         // so that the Envelope request is exposed. This is only used in testing currently.
+        // 创建 Socket Server 组件
         socketServer = new SocketServer(config, metrics, time, credentialProvider, apiVersionManager)
+        // 启动 Socket Server, 但不启动 Processor 线程
         socketServer.startup(startProcessingRequests = false)
 
         /* start replica manager */
@@ -373,6 +377,7 @@ class KafkaServer(
           autoTopicCreationManager, config.brokerId, config, configRepository, metadataCache, metrics, authorizer, quotaManagers,
           fetchManager, brokerTopicStats, clusterId, time, tokenManager, apiVersionManager)
 
+        // data plane 请求处理线程池初始大小为 Broker 端参数 num.io.threads, 即这里的 config.numIoThreads
         dataPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
           config.numIoThreads, s"${SocketServer.DataPlaneMetricPrefix}RequestHandlerAvgIdlePercent", SocketServer.DataPlaneThreadPrefix)
 
@@ -381,6 +386,7 @@ class KafkaServer(
             autoTopicCreationManager, config.brokerId, config, configRepository, metadataCache, metrics, authorizer, quotaManagers,
             fetchManager, brokerTopicStats, clusterId, time, tokenManager, apiVersionManager)
 
+          // control plane 请求处理线程池初始大小则硬编码为1
           controlPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.controlPlaneRequestChannelOpt.get, controlPlaneRequestProcessor, time,
             1, s"${SocketServer.ControlPlaneMetricPrefix}RequestHandlerAvgIdlePercent", SocketServer.ControlPlaneThreadPrefix)
         }
@@ -401,6 +407,7 @@ class KafkaServer(
         dynamicConfigManager = new DynamicConfigManager(zkClient, dynamicConfigHandlers)
         dynamicConfigManager.startup()
 
+        // 启动 Data plane 和 Control plane 的所有线程
         socketServer.startProcessingRequests(authorizerFutures)
 
         brokerState = BrokerState.RUNNING

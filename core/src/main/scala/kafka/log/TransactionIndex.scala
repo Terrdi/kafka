@@ -39,6 +39,9 @@ private[log] case class TxnIndexSearchResult(abortedTransactions: List[AbortedTx
  * whose commit markers were written in the corresponding log segment. Note, however, that individual transactions
  * may span multiple segments. Recovering the index therefore requires scanning the earlier segments in
  * order to find the start of the transactions.
+ *
+ * 定义事务索引, 为已中止事务(Aborted Transaction)保存重要的元数据信息。
+ * 只有启用 Kafka 事务后，这个索引才有可能出现
  */
 @nonthreadsafe
 class TransactionIndex(val startOffset: Long, @volatile private var _file: File) extends Logging {

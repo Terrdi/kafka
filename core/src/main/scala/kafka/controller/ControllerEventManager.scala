@@ -67,6 +67,15 @@ class QueuedEvent(val event: ControllerEvent,
   }
 }
 
+/**
+ * 定义各种Controller事件 (Controller Event) {@link ControllerEvent}
+ * 以及这些事件被处理的代码
+ * @param controllerId
+ * @param processor
+ * @param time
+ * @param rateAndTimeMetrics
+ * @param eventQueueTimeTimeoutMs
+ */
 class ControllerEventManager(controllerId: Int,
                              processor: ControllerEventProcessor,
                              time: Time,
