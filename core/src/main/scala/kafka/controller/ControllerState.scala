@@ -19,10 +19,21 @@ package kafka.controller
 
 import scala.collection.Seq
 
+/**
+ * 状态值
+ */
 sealed abstract class ControllerState {
 
+  /**
+   * 定义一个 value 值，表示 Controller 状态的序号，从0开始。
+   * @return
+   */
   def value: Byte
 
+  /**
+   * 用于构造 Controller 状态速率的监控指标名称
+   * @return
+   */
   def rateAndTimeMetricName: Option[String] =
     if (hasRateAndTimeMetric) Some(s"${toString}RateAndTimeMs") else None
 
