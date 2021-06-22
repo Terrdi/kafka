@@ -18,10 +18,20 @@ package kafka.utils.timer
 
 trait TimerTask extends Runnable {
 
+  /**
+   * 通常是 request.timeout.ms 参数值
+   */
   val delayMs: Long // timestamp in millisecond
 
+  /**
+   * 每个 TimerTask 实例关联一个 TimerTaskEntry
+   * 就是说 每个定时任务需要知道它在哪个 Bucket 链表下的哪个链表元素上
+   */
   private[this] var timerTaskEntry: TimerTaskEntry = null
 
+  /**
+   * 取消定时任务
+   */
   def cancel(): Unit = {
     synchronized {
       if (timerTaskEntry != null) timerTaskEntry.remove()
@@ -29,6 +39,10 @@ trait TimerTask extends Runnable {
     }
   }
 
+  /**
+   * 关联 timerTaskEntry, 原理是重新给 timerTaskEntry 字段赋值
+   * @param entry
+   */
   private[timer] def setTimerTaskEntry(entry: TimerTaskEntry): Unit = {
     synchronized {
       // if this timerTask is already held by an existing timer task entry,
@@ -40,6 +54,10 @@ trait TimerTask extends Runnable {
     }
   }
 
+  /**
+   * 获取关联的 timerTaskEntry 实例
+   * @return
+   */
   private[timer] def getTimerTaskEntry: TimerTaskEntry = timerTaskEntry
 
 }

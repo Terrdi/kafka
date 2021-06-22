@@ -95,22 +95,55 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * This class is not thread-safe. There should not be any add calls while advanceClock is executing.
  * It is caller's responsibility to enforce it. Simultaneous add calls are thread-safe.
+ *
+ * JDK 自带的 {@link DelayQueue} 插入和删除队列元素的时间复杂度是O(logN)
+ */
+/**
+ *
+ * @param tickMs 滴答一次的时长，类似于手表的例子中向前推进一格的时间。
+ *               在 Kafka 中，第1层时间轮的 tickMs 被固定为 1毫秒，也就是说，向前推进一格 Bucket 的时长为 1毫秒
+ * @param wheelSize 每一层时间轮上 Bucket 数量。第 1 层的 Bucket 数量是 20
+ * @param startMs 时间轮对象被创建时的起始时间戳
+ * @param taskCounter 这一层时间轮上的总定时任务数
+ * @param queue 将所有 Bucket 按照过期时间排序的延迟队列。随着时间不断向前推进。
+ *              Kafka 需要依靠这个队列获取已过期的 Bucket，并清除它们
  */
 @nonthreadsafe
 private[timer] class TimingWheel(tickMs: Long, wheelSize: Int, startMs: Long, taskCounter: AtomicInteger, queue: DelayQueue[TimerTaskList]) {
 
+  /**
+   * 这层时间轮总时长，等于 滴答时长 X wheelSize
+   */
   private[this] val interval = tickMs * wheelSize
+
+  /**
+   * 时间轮下的所有 Bucket 对象，也就是所有 TimerTaskList 对象
+   */
   private[this] val buckets = Array.tabulate[TimerTaskList](wheelSize) { _ => new TimerTaskList(taskCounter) }
 
+  /**
+   * 当前时间戳
+   * 将它设置成小于当前时间的最大滴答时长的整数倍
+   */
   private[this] var currentTime = startMs - (startMs % tickMs) // rounding down to multiple of tickMs
 
   // overflowWheel can potentially be updated and read by two concurrent threads through add().
   // Therefore, it needs to be volatile due to the issue of Double-Checked Locking pattern with JVM
+  /**
+   * Kafka 是按需创建上层时间轮的。
+   * 当有新的定时任务到达时，会尝试将其放入第1层时间轮。
+   * 如果第1层的interval无法容纳定时任务的超时时间，就现场创建并配置好第2层时间轮，并再次尝试放入
+   * 如果依然无法容纳，那么就再创建和配置第3层时间轮，一次类推，直到找到适合容纳该定时任务的第N层时间轮
+   */
   @volatile private[this] var overflowWheel: TimingWheel = null
 
   private[this] def addOverflowWheel(): Unit = {
     synchronized {
+      // 只有之前没有创建上层时间轮方法才会继续
       if (overflowWheel == null) {
+        // 创建新的TimingWheel实例
+        // 滴答时长 ticketMs 等于下层时间轮总时长
+        // 每层的轮子数都是相同的
         overflowWheel = new TimingWheel(
           tickMs = interval,
           wheelSize = wheelSize,
@@ -123,21 +156,25 @@ private[timer] class TimingWheel(tickMs: Long, wheelSize: Int, startMs: Long, ta
   }
 
   def add(timerTaskEntry: TimerTaskEntry): Boolean = {
+    // 获取定时任务的过期时间戳
     val expiration = timerTaskEntry.expirationMs
 
-    if (timerTaskEntry.cancelled) {
+    if (timerTaskEntry.cancelled) { // 如果该任务已被取消了，则无需添加直接返回
       // Cancelled
       false
-    } else if (expiration < currentTime + tickMs) {
+    } else if (expiration < currentTime + tickMs) { // 如果该任务超时时间已过期
       // Already expired
       false
-    } else if (expiration < currentTime + interval) {
+    } else if (expiration < currentTime + interval) { // 如果该任务超时时间在本层时间轮覆盖时间范围内
       // Put in its own bucket
       val virtualId = expiration / tickMs
+
+      // 计算要被放入到哪个 Bucket 中
       val bucket = buckets((virtualId % wheelSize.toLong).toInt)
       bucket.add(timerTaskEntry)
 
-      // Set the bucket expiration time
+      // Set the bucket expiration time 设置 Bucket 过期时间
+      // 如果该时间变更过，说明 Bucket 是新建或被重用，将其家回道 DelayQueue
       if (bucket.setExpiration(virtualId * tickMs)) {
         // The bucket needs to be enqueued because it was an expired bucket
         // We only need to enqueue the bucket when its expiration time has changed, i.e. the wheel has advanced
@@ -147,16 +184,22 @@ private[timer] class TimingWheel(tickMs: Long, wheelSize: Int, startMs: Long, ta
         queue.offer(bucket)
       }
       true
-    } else {
+    } else { // 本层时间轮无法容纳该任务，交由上层时间轮处理
       // Out of the interval. Put it into the parent timer
-      if (overflowWheel == null) addOverflowWheel()
-      overflowWheel.add(timerTaskEntry)
+      if (overflowWheel == null) addOverflowWheel() // 按需创建上层时间轮
+      overflowWheel.add(timerTaskEntry) // 加入到上层时间轮中
     }
   }
 
   // Try to advance the clock
+  /**
+   * 向前驱动时钟的方法， 由 Kafka 后台专属的 Reaper 线程发起的
+   * @param timeMs 推进到目标节点
+   */
   def advanceClock(timeMs: Long): Unit = {
+    // 向前驱动到的时间要超过 Bucket 的时间返回，才是有意义的推进，否则什么都不做
     if (timeMs >= currentTime + tickMs) {
+      // 更新当前时间 currentTime 到下一个 Bucket 的起始时点
       currentTime = timeMs - (timeMs % tickMs)
 
       // Try to advance the clock of the overflow wheel if present
