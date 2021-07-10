@@ -238,9 +238,10 @@ public class WorkerConfig extends AbstractConfig {
     public static final String CONNECTOR_CLIENT_POLICY_CLASS_CONFIG = "connector.client.config.override.policy";
     public static final String CONNECTOR_CLIENT_POLICY_CLASS_DOC =
         "Class name or alias of implementation of <code>ConnectorClientConfigOverridePolicy</code>. Defines what client configurations can be "
-        + "overriden by the connector. The default implementation is `None`. The other possible policies in the framework include `All` "
-        + "and `Principal`. ";
-    public static final String CONNECTOR_CLIENT_POLICY_CLASS_DEFAULT = "None";
+        + "overriden by the connector. The default implementation is `All`, meaning connector configurations can override all client properties. "
+        + "The other possible policies in the framework include `None` to disallow connectors from overriding client properties, "
+        + "and `Principal` to allow connectors to override only client principals.";
+    public static final String CONNECTOR_CLIENT_POLICY_CLASS_DEFAULT = "All";
 
 
     public static final String METRICS_SAMPLE_WINDOW_MS_CONFIG = CommonClientConfigs.METRICS_SAMPLE_WINDOW_MS_CONFIG;
@@ -285,8 +286,7 @@ public class WorkerConfig extends AbstractConfig {
                 .define(CLIENT_DNS_LOOKUP_CONFIG,
                         Type.STRING,
                         ClientDnsLookup.USE_ALL_DNS_IPS.toString(),
-                        in(ClientDnsLookup.DEFAULT.toString(),
-                           ClientDnsLookup.USE_ALL_DNS_IPS.toString(),
+                        in(ClientDnsLookup.USE_ALL_DNS_IPS.toString(),
                            ClientDnsLookup.RESOLVE_CANONICAL_BOOTSTRAP_SERVERS_ONLY.toString()),
                         Importance.MEDIUM,
                         CLIENT_DNS_LOOKUP_DOC)
@@ -523,6 +523,11 @@ public class WorkerConfig extends AbstractConfig {
                     throw new ConfigException("Empty listener found when parsing list.");
                 }
             }
+        }
+
+        @Override
+        public String toString() {
+            return "List of comma-separated URIs, ex: http://localhost:8080,https://localhost:8443.";
         }
     }
 

@@ -17,9 +17,12 @@
 
 package kafka.server
 
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.{CountDownLatch, TimeUnit}
+import kafka.network._
+import kafka.utils._
+import kafka.metrics.KafkaMetricsGroup
 
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 import com.yammer.metrics.core.Meter
 import kafka.metrics.KafkaMetricsGroup
 import kafka.network._
@@ -31,7 +34,7 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 trait ApiRequestHandler {
-  def handle(request: RequestChannel.Request): Unit
+  def handle(request: RequestChannel.Request, requestLocal: RequestLocal): Unit
 }
 
 /**
@@ -52,8 +55,9 @@ class KafkaRequestHandler(id: Int,
                           val requestChannel: RequestChannel,
                           apis: ApiRequestHandler,
                           time: Time) extends Runnable with Logging {
-  this.logIdent = "[Kafka Request Handler " + id + " on Broker " + brokerId + "], "
+  this.logIdent = s"[Kafka Request Handler $id on Broker $brokerId], "
   private val shutdownComplete = new CountDownLatch(1)
+  private val requestLocal = RequestLocal.withThreadConfinedCaching
   @volatile private var stopped = false
 
   def run(): Unit = {
@@ -76,7 +80,7 @@ class KafkaRequestHandler(id: Int,
         case RequestChannel.ShutdownRequest =>
           debug(s"Kafka request handler $id on broker $brokerId received shut down command")
           // 关闭线程
-          shutdownComplete.countDown()
+          completeShutdown()
           return
         // 普通请求
         case request: RequestChannel.Request =>
@@ -84,11 +88,11 @@ class KafkaRequestHandler(id: Int,
             request.requestDequeueTimeNanos = endTime
             trace(s"Kafka request handler $id on broker $brokerId handling request $request")
             // 由 KafkaApis.handle 方法执行相应处理逻辑
-            apis.handle(request)
+            apis.handle(request, requestLocal)
           } catch {
             // 如果出现严重错误，立即关闭线程
             case e: FatalExitError =>
-              shutdownComplete.countDown()
+              completeShutdown()
               Exit.exit(e.statusCode)
             // 如果是普通错误， 记录错误日志
             case e: Throwable => error("Exception when handling request", e)
@@ -100,6 +104,11 @@ class KafkaRequestHandler(id: Int,
         case null => // continue, 继续
       }
     }
+    completeShutdown()
+  }
+
+  private def completeShutdown(): Unit = {
+    requestLocal.close()
     shutdownComplete.countDown()
   }
 

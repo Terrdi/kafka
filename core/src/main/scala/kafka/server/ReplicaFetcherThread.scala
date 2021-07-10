@@ -44,7 +44,7 @@ import scala.collection.{Map, mutable}
 import scala.compat.java8.OptionConverters._
 
 /**
- *
+ * 主要职责是 帮助 Follower 副本像 Leader 副本拉去消息，并写入到本地日志中
  * @param name 线程名称
  * @param fetcherId Follower 拉去的线程Id, 也就是线程的编号
  * @param sourceBroker 数据源Broker地址 Leader
