@@ -43,6 +43,19 @@ import scala.jdk.CollectionConverters._
 import scala.collection.{Map, mutable}
 import scala.compat.java8.OptionConverters._
 
+/**
+ * 主要职责是 帮助 Follower 副本像 Leader 副本拉去消息，并写入到本地日志中
+ * @param name
+ * @param fetcherId
+ * @param sourceBroker
+ * @param brokerConfig
+ * @param failedPartitions
+ * @param replicaMgr
+ * @param metrics
+ * @param time
+ * @param quota
+ * @param leaderEndpointBlockingSend
+ */
 class ReplicaFetcherThread(name: String,
                            fetcherId: Int,
                            sourceBroker: BrokerEndPoint,
